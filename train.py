@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
 import torch.optim as optim
+import sys
 
 import time
 import os
@@ -27,7 +28,7 @@ class MNISTnet(torch.nn.Module):
 
 class MNISTnet2(torch.nn.Module):
     def __init__(self):
-        super(MNISTnet2, self).__init__()
+        super().__init__() # Same as super(MNISTnet2, this).__init__().
         self.conv = torch.nn.Sequential(
             nn.Conv2d(1, 20, 5, 1),
             nn.ReLU(inplace=True),
@@ -72,9 +73,9 @@ def train(model, train_loader, optimizer, loss_fn = F.cross_entropy,
         loss.backward()
         optimizer.step()
         if batch_idx % 10 == 0:
-            print(100. * batch_idx / len(train_loader))
+            print("{:.0f} %".format(100. * batch_idx / len(train_loader)))
 
-    print("{:.3f}".format(time.time()-time0))
+    print("Epoch time: {:.3f}".format(time.time()-time0))
     return time.time()-time0
 
 def test(model, test_loader, loss_fn = F.cross_entropy,
@@ -94,37 +95,65 @@ def test(model, test_loader, loss_fn = F.cross_entropy,
                 print(100. * (batch_idx+1) / len(test_loader))
     test_loss = test_loss.item()/len(test_loader.dataset) # average test loss
     accuracy = correct.item()/len(test_loader.dataset) # accuracy
-    return (test_loss, accuracy)
+    return test_loss, accuracy
+
+class MemoizeDataset(torch.utils.data.Dataset):
+    """Class to memoize preprocessed datasets. Should not be used if data set is transformed non-deterministically."""
+    # We can add transform and target_transform argument also, such that we memoize the pre-preprocess, while still
+    #  allowing for non-determnistic/statefull preprocessing on cpu.
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.memo = [None] * len(self)
+
+    def __getitem__(self, index):
+        if self.memo[index] is not None:
+            return self.memo[index]
+        else:
+            self.memo[index] = self.dataset[index]
+            return self.memo[index]
+
+    def __len__(self):
+        return len(self.dataset)
+
+
 
 if __name__ == '__main__':
-    
     torch.manual_seed(5) # reproducible, since we shuffle in DataLoader.
-    
+
     # Load Dataset
     train_set = torchvision.datasets.MNIST('mnist', train=True, download=True, transform=transforms.ToTensor())
     test_set = torchvision.datasets.MNIST('mnist', train=False, download=True, transform=transforms.ToTensor())
-    
+
+    # Memoize the lists
+    train_set, test_set = MemoizeDataset(train_set), MemoizeDataset(test_set)
+
     # For test loader, the batch_size should just be as large as can fit in memory.
     # pin_memory = true may make CUDA transfer faster.
     # torch.set_num_threads(8) # We have not seen an improvement in CPU utilization with this.
     num_preprocess_workers = 0 if os.cpu_count() is not None else os.cpu_count() # Just max out all CPUs
     test_batch_size = len(test_set) #Should just be as large as possible. (Limited by GPU memory)
-    train_loader = torch.utils.data.DataLoader(train_set, batch_size=256, shuffle=True, num_workers=8, pin_memory=True)
-    test_loader = torch.utils.data.DataLoader(test_set, batch_size=test_batch_size, shuffle=False, num_workers=num_preprocess_workers/2, pin_memory=True)
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size=256, shuffle=True,
+                                               num_workers=num_preprocess_workers, pin_memory=True)
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size=test_batch_size, shuffle=False,
+                                              num_workers=num_preprocess_workers, pin_memory=True)
     
     model = MNISTnet()
-    #If CPU is not in use, while GPU calculates, we can also test on CPU?
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.device_count() > 1:
+    #If CPU is not in use while GPU calculates, we can also test on CPU?
+    if torch.cuda.is_available():
+        device = torch.device("cuda") # Defaults to cuda:0
         print("Using ", torch.cuda.device_count(), "GPUs.")
-        model = nn.DataParallel(model)
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+    else:
+        device = torch.device("cpu")
+
     model = model.to(device, non_blocking=True)
     
     optimizer = optim.Adagrad(model.parameters(), lr=1e-1)
     #train(model, train_loader, optimizer, device=device)
     #test_loss, test_acc = test(model, train_loader, device=device)
     #print(test_acc)
-    n = 1
+    n = 3
     timeavg = 0.0
     for i in range(n):
         timeavg += train(model, train_loader, optimizer, device=device)
