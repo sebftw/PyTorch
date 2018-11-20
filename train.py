@@ -115,8 +115,6 @@ class MemoizeDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.dataset)
 
-
-
 if __name__ == '__main__':
     torch.manual_seed(5) # reproducible, since we shuffle in DataLoader.
 
@@ -130,7 +128,8 @@ if __name__ == '__main__':
     # For test loader, the batch_size should just be as large as can fit in memory.
     # pin_memory = true may make CUDA transfer faster.
     # torch.set_num_threads(8) # We have not seen an improvement in CPU utilization with this.
-    num_preprocess_workers = 0 if os.cpu_count() is not None else os.cpu_count() # Just max out all CPUs
+    num_preprocess_workers = os.cpu_count() if os.cpu_count() is not None else 0 # Just max out all CPUs
+    print(num_preprocess_workers)
     test_batch_size = len(test_set) #Should just be as large as possible. (Limited by GPU memory)
     train_loader = torch.utils.data.DataLoader(train_set, batch_size=256, shuffle=True,
                                                num_workers=num_preprocess_workers, pin_memory=True)
