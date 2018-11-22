@@ -10,6 +10,8 @@ import time
 import os
 import funcy
 import concurrent.futures
+import multiprocessing
+from multiprocessing import Pool
 
 import pickle
 
@@ -99,42 +101,29 @@ def test(model, test_loader, loss_fn = F.cross_entropy,
     accuracy = correct.item()/len(test_loader.dataset) # accuracy
     return test_loss, accuracy
 
-class MemoizeDataset(torch.utils.data.Dataset):
-    """Class to memoize preprocessed datasets. Should not be used if data set is transformed non-deterministically."""
-    # We can add transform and target_transform argument also, such that we memoize the pre-preprocess, while still
-    #  allowing for non-determnistic/statefull preprocessing on cpu.
-    def __init__(self, dataset):
-        self.dataset = dataset
-        self.memo = [None] * len(self)
-
-    def __getitem__(self, index):
-        if self.memo[index] is not None:
-            return self.memo[index]
-        else:
-            self.memo[index] = self.dataset[index]
-            return self.memo[index]
-
-    def __len__(self):
-        return len(self.dataset)
-
-class MemoizeDataset2(torchvision.datasets.MNIST):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.memo = [None] * len(self)
-
-    # Override __getitem__
-    def __getitem__(self, index):
-        if self.memo[index] is not None:
-            return self.memo[index]
-        else:
-            self.memo[index] = super(MemoizeDataset2, self).__getitem__(index)
-            return self.memo[index]
-
 class PrePreprocess(torch.utils.data.Dataset):
     def __init__(self, dataset):
-        #self.memo = [None] * len(dataset)
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            self.memo = list(executor.map(dataset.__getitem__, range(len(dataset))))
+        super().__init__()
+        time0 = time.time()
+        
+        # Just try to max out all CPUs
+        # If we get an out of memory error, batch_size is too large.
+        num_workers = os.cpu_count()
+        batch_size = 1
+        if num_workers is None:
+            num_workers = 0
+        else:
+            batch_size = len(dataset) / num_workers
+        
+        loader = torch.utils.data.DataLoader(dataset, num_workers=num_workers, batch_size = 4000)
+        data = []
+        target = []
+        for result in loader:
+            data.extend(result[0])
+            target.extend(result[1])
+        self.memo = list(zip(data, target))
+        
+        print("Epoch time: {:.3f}".format(time.time()-time0))
 
     def __getitem__(self, index):
         return self.memo[index]
@@ -162,16 +151,14 @@ if __name__ == '__main__':
 
     # Memoize the lists
     train_set, test_set = PrePreprocess(train_set), PrePreprocess(test_set)
-
+    
     # For test loader, the batch_size should just be as large as can fit in memory.
     # pin_memory = true may make CUDA transfer faster.
     # torch.set_num_threads(8) # We have not seen an improvement in CPU utilization with this.
-    num_preprocess_workers = os.cpu_count() if os.cpu_count() is not None else 0 # Just max out all CPUs
+    
     test_batch_size = len(test_set) #Should just be as large as possible. (Limited by GPU memory)
-    train_loader = torch.utils.data.DataLoader(train_set, batch_size=256, shuffle=True,
-                                               num_workers=num_preprocess_workers, pin_memory=True)
-    test_loader = torch.utils.data.DataLoader(test_set, batch_size=test_batch_size, shuffle=False,
-                                              num_workers=num_preprocess_workers, pin_memory=True)
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size=256, shuffle=True, pin_memory=True)
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size=test_batch_size, shuffle=False, pin_memory=True)
 
     model = MNISTnet()
     #If CPU is not in use while GPU calculates, we can also test on CPU?
@@ -192,6 +179,7 @@ if __name__ == '__main__':
     #print(test_acc)
     n = 3
     timeavg = 0.0
+    print("?")
     for i in range(n):
         timeavg += train(model, train_loader, optimizer, device=device)
     timeavg /= n
