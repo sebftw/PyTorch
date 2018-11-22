@@ -9,6 +9,8 @@ import torch.optim as optim
 import time
 import os
 import funcy
+import concurrent.futures
+
 import pickle
 
 # 8 layers of 128 neurons each, mini-batches of 64.
@@ -128,6 +130,17 @@ class MemoizeDataset2(torchvision.datasets.MNIST):
             self.memo[index] = super(MemoizeDataset2, self).__getitem__(index)
             return self.memo[index]
 
+class PrePreprocess(torch.utils.data.Dataset):
+    def __init__(self, dataset):
+        #self.memo = [None] * len(dataset)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            self.memo = list(executor.map(dataset.__getitem__, range(len(dataset))))
+
+    def __getitem__(self, index):
+        return self.memo[index]
+
+    def __len__(self):
+        return len(self.memo)
 
 
 
@@ -144,11 +157,11 @@ if __name__ == '__main__':
     torch.manual_seed(5) # reproducible, since we shuffle in DataLoader.
 
     # Load Dataset
-    train_set = MemoizeDataset2('mnist', train=True, download=True, transform=transforms.ToTensor())
-    test_set = MemoizeDataset2('mnist', train=False, download=True, transform=transforms.ToTensor())
+    train_set = torchvision.datasets.MNIST('mnist', train=True, download=True, transform=transforms.ToTensor())
+    test_set = torchvision.datasets.MNIST('mnist', train=False, download=True, transform=transforms.ToTensor())
 
     # Memoize the lists
-    #train_set, test_set = MemoizeDataset(train_set), MemoizeDataset(test_set)
+    train_set, test_set = PrePreprocess(train_set), PrePreprocess(test_set)
 
     # For test loader, the batch_size should just be as large as can fit in memory.
     # pin_memory = true may make CUDA transfer faster.
