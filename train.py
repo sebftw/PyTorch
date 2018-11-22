@@ -3,32 +3,38 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 import torch.nn.functional as F
 
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 import numpy as np
 import torch.optim as optim
-import time
-import os
-import funcy
-import concurrent.futures
-import multiprocessing
+import time, os
 from multiprocessing import Pool
 
-import pickle
+def timing(f):
+    def wrap(*args, **kwargs):
+        time1 = time.time()
+        ret = f(*args, **kwargs)
+        time2 = time.time()
+        print('{:s} function took {:.3f} ms'.format(f.__name__, time2-time1))
+
+        return ret
+    return wrap
 
 # 8 layers of 128 neurons each, mini-batches of 64.
 
 class MNISTnet(torch.nn.Module):
     def __init__(self):
         super(MNISTnet, self).__init__()
-        self.input = torch.nn.Linear(28*28, 128)
+        self.input = torch.nn.Linear(28*28, 128 * 8)
         self.hidden = [nn.ReLU() for _ in range(8)]
-        self.output = torch.nn.Linear(128, 10)
+        self.output = torch.nn.Linear(128 * 8, 10)
 
     def forward(self, x):
-        x = self.input(x.view(x.size(0), -1))
+        x = x.view(x.size(0), -1)
+        x = self.input(x)
         for hidden in self.hidden:
             x = hidden(x)
-        return self.output(x)
+        x = self.output(x)
+        return x
 
 class MNISTnet2(torch.nn.Module):
     def __init__(self):
@@ -47,13 +53,9 @@ class MNISTnet2(torch.nn.Module):
             nn.Linear(500, 10) )
 
     def forward(self, x):
-        #x = self.input(x)
         x = self.conv(x)
         x = self.fullc(x.view(-1, 4 * 4 * 50))
         return x
-
-# One mode is train for many epochs (till there is no more improvement - criteria) and then test the function.
-#  Or test at regular intervals, and stop when testing error is not improving.
 
 def profile(func, use_cuda=torch.cuda.is_available(), path=None):
     with torch.autograd.profiler.profile(use_cuda=use_cuda) as prof:
@@ -65,23 +67,23 @@ def profile(func, use_cuda=torch.cuda.is_available(), path=None):
     #    model(train_set[0])  # Warmup CUDA memory allocator and profiler
     #    with torch.autograd.profiler.emit_nvtx():
 
+@timing
 def train(model, train_loader, optimizer, loss_fn = F.cross_entropy,
           device = None):
     time0 = time.time()
+    train_loss = torch.zeros([1], dtype=torch.float, device=device)
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
         optimizer.zero_grad()
         output = model(data)
         loss = loss_fn(output, target)
+        train_loss.add_(loss)
         loss.backward()
-        optimizer.step()
-        if batch_idx % 10 == 0: # Make timed condition instead, e.g. every 5 seconds print and estimated time left.
-            print("{:.0f} %".format(100. * (batch_idx+1) / len(train_loader)))
+        optimizer.step(lambda: loss)
+    return train_loss.item() / len(train_loader.dataset)
 
-    print("Epoch time: {:.3f}".format(time.time()-time0))
-    return time.time()-time0
-
+@timing
 def test(model, test_loader, loss_fn = F.cross_entropy,
           device = None):
     test_loss = torch.zeros([1], dtype=torch.float, device=device)
@@ -98,32 +100,49 @@ def test(model, test_loader, loss_fn = F.cross_entropy,
             #if batch_idx % 10 == 0:
             #    print("{:.0f} %".format(100. * batch_idx / len(test_loader)))
     test_loss = test_loss.item()/len(test_loader.dataset) # average test loss
-    accuracy = correct.item()/len(test_loader.dataset) # accuracy
-    return test_loss, accuracy
+    correct = correct.item(); #= correct.item()/len(test_loader.dataset) # accuracy
+    return test_loss, correct/len(test_loader.dataset), correct
+
+
 
 class PrePreprocess(torch.utils.data.Dataset):
-    def __init__(self, dataset):
-        super().__init__()
-        time0 = time.time()
-        
+    # This class saves datasets (after they're transformed/preprocessed) to desk
+    # This may take up a lot of disk space, but it saves some seconds everytime
+    #  on every run of the script. Makes it faster to debug/test.
+    
+    @staticmethod
+    def preprocess(dataset):
         # Just try to max out all CPUs
         # If we get an out of memory error, batch_size is too large.
-        num_workers = os.cpu_count()
-        batch_size = 1
+        num_workers, batch_size = os.cpu_count(), 1
         if num_workers is None:
             num_workers = 0
         else:
-            batch_size = len(dataset) / num_workers
+            batch_size = int(len(dataset) / num_workers)
         
-        loader = torch.utils.data.DataLoader(dataset, num_workers=num_workers, batch_size = 4000)
-        data = []
-        target = []
+        loader = torch.utils.data.DataLoader(dataset, num_workers=num_workers, batch_size = batch_size)
+        data, target = [], []
         for result in loader:
             data.extend(result[0])
             target.extend(result[1])
-        self.memo = list(zip(data, target))
+        return list(zip(data, target))
+    
+    def __init__(self, dataset, path=None, *args, **kwargs):
+        super().__init__()
         
-        print("Epoch time: {:.3f}".format(time.time()-time0))
+        if callable(dataset):
+            dataset = dataset(*args, **kwargs)
+        
+        if path is not None:
+            try:
+                self.memo = torch.load(open(path, "rb"))
+            except (OSError, IOError) as e:
+                print("Failed to load pre-preprocessed data. Creating files.")
+                self.memo = PrePreprocess.preprocess(dataset)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                torch.save(self.memo, open(path, "wb"))
+        else:
+            self.memo = PrePreprocess.preprocess(dataset)
 
     def __getitem__(self, index):
         return self.memo[index]
@@ -132,59 +151,44 @@ class PrePreprocess(torch.utils.data.Dataset):
         return len(self.memo)
 
 
-
-#class Mystery:
-#    @funcy.memoize
-#    def __new__(cls, num):
-#        self = super().__new__(cls)
-#        self.num = num
-#        return self
-#    def __reduce__(self):
-#        return (type(self), (self.num,))
-
 if __name__ == '__main__':
     torch.manual_seed(5) # reproducible, since we shuffle in DataLoader.
-
-    # Load Dataset
-    train_set = torchvision.datasets.MNIST('mnist', train=True, download=True, transform=transforms.ToTensor())
-    test_set = torchvision.datasets.MNIST('mnist', train=False, download=True, transform=transforms.ToTensor())
-
-    # Memoize the lists
-    train_set, test_set = PrePreprocess(train_set), PrePreprocess(test_set)
     
+    # Load and and preprocess datasets (or load pre-preprocessed)
+    data_root = 'mnist'
+    train_set = PrePreprocess(torchvision.datasets.MNIST, os.path.join(data_root, 'preprocessed', 'training.pt'),
+                                data_root, train=True, download=True, transform=transforms.ToTensor())
+    test_set = PrePreprocess(torchvision.datasets.MNIST, os.path.join(data_root, 'preprocessed', 'test.pt'),
+                                data_root, train=False, download=True, transform=transforms.ToTensor())
     # For test loader, the batch_size should just be as large as can fit in memory.
     # pin_memory = true may make CUDA transfer faster.
     # torch.set_num_threads(8) # We have not seen an improvement in CPU utilization with this.
     
-    test_batch_size = len(test_set) #Should just be as large as possible. (Limited by GPU memory)
-    train_loader = torch.utils.data.DataLoader(train_set, batch_size=256, shuffle=True, pin_memory=True)
-    test_loader = torch.utils.data.DataLoader(test_set, batch_size=test_batch_size, shuffle=False, pin_memory=True)
-
+    test_batch_size = 2<<9
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size=256, shuffle=True, pin_memory=False)
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size=test_batch_size, shuffle=False, pin_memory=False)
+    
     model = MNISTnet()
     #If CPU is not in use while GPU calculates, we can also test on CPU?
     if torch.cuda.is_available():
         device = torch.device("cuda") # Defaults to cuda:0
         print("Using ", torch.cuda.device_count(), "GPUs.")
         if torch.cuda.device_count() > 1:
-            model = nn.DataParallel(model)
+            model = nn.DataParallel(model) # Have not been tested
     else:
         print("Using", num_preprocess_workers, "CPUs.")
         device = torch.device("cpu")
-
+    
     model = model.to(device, non_blocking=True)
     
     optimizer = optim.Adagrad(model.parameters(), lr=1e-1)
     #train(model, train_loader, optimizer, device=device)
     #test_loss, test_acc = test(model, train_loader, device=device)
     #print(test_acc)
-    n = 3
-    timeavg = 0.0
-    print("?")
+    n = 10
     for i in range(n):
-        timeavg += train(model, train_loader, optimizer, device=device)
-    timeavg /= n
+        train(model, train_loader, optimizer, device=device)
     # Possibly save model if it is good.
-    print(timeavg)
     print(test(model, test_loader, device=device))
     #profile(lambda: , path="trace")
 
